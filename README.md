@@ -21,6 +21,15 @@ codex resume <SESSION_ID> --cd /path/to/project
 
 以上为虚拟示例，实际颜色由终端显示。
 
+## 界面预览
+
+[![codex-sessions 脱敏截图：按路径配色，展示执行起止时间与高亮跟随](docs/assets/sessions-preview.png)](docs/assets/sessions-redacted.png)
+
+会话标题中的项目名和任务内容已遮挡；未上传原始截图。
+
+官网页面源码位于 [`docs/`](docs/)，包含功能介绍、安装命令、快捷键和完整截图。
+
+
 ## 功能
 
 | 能力 | 说明 |
@@ -208,3 +217,24 @@ rm "$HOME/.local/bin/codex-sessions"
 ```
 
 如果使用了自定义安装目录，请删除对应文件。卸载不会删除 Codex 的会话记录。
+
+
+## 官网部署（GitHub Pages）
+
+这是无需构建的静态站点。推送后在仓库 **Settings → Pages** 中设置：
+
+- Source：**Deploy from a branch**
+- Branch：**main**
+- Folder：**/docs**
+
+保存后由 GitHub 自动发布，默认地址为：
+
+<https://joker311223.github.io/codex-sessions/>
+
+本地预览：
+
+```bash
+python3 -m http.server 8000 --directory docs
+```
+
+然后打开 <http://localhost:8000/>。
