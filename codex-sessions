@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Persistent picker with official Codex session rename support."""
+import argparse
+from contextlib import closing
+import curses
+import datetime
+import hashlib
+from functools import lru_cache
+import json
+import os
+import selectors
+from pathlib import Path
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+import uuid
+
+
+def database(home):
+    candidates = list(home.glob('state_*.sqlite'))
+    if not candidates:
+        raise RuntimeError(f'未找到会话索引：{home}/state_*.sqlite。请先启动一次 Codex。')
+    return max(candidates, key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else -1)
+
+
+def load_sessions(home, archived=False, cli_only=False):
+    path = database(home)
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
+        connection.row_factory = sqlite3.Row
+        sources = ('cli',) if cli_only else ('cli', 'vscode')
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+        title_expr = "COALESCE(NULLIF(name, ''), title) AS title" if 'name' in columns else 'title'
+        rollout_expr = 'rollout_path' if 'rollout_path' in columns else 'NULL AS rollout_path'
+        sql = 'SELECT id, ' + title_expr + ', ' + rollout_expr + ', cwd, updated_at, archived, source FROM threads WHERE source IN (' + ','.join('?' for _ in sources) + ')'
+        if not archived:
+            sql += ' AND archived = 0'
+        sql += ' ORDER BY updated_at DESC, id DESC'
+        return [dict(row) for row in connection.execute(sql, sources)]
+
+
+def event_time(value):
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e12 else value
+    if isinstance(value, str):
+        try:
+            return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+@lru_cache(maxsize=2048)
+def lifecycle_tail(path, modified_ns, size):
+    # Only inspect recent lifecycle events; never substitute file/metadata update times.
+    events = []
+    with open(path, 'rb') as stream:
+        offset = max(0, size - 2 * 1024 * 1024)
+        stream.seek(offset)
+        if offset:
+            stream.readline()
+        for raw in stream:
+            try:
+                record = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            payload = record.get('payload', {})
+            if record.get('type') == 'event_msg' and isinstance(payload, dict) and payload.get('type') in ('task_started', 'task_complete', 'turn_aborted', 'task_failed', 'task_aborted'):
+                events.append((record, payload))
+    if not events:
+        return {'start': None, 'finish': None, 'state': '未知', 'duration_ms': None}
+    record, payload = events[-1]
+    kind = payload['type']
+    started = event_time(payload.get('started_at'))
+    if started is None:
+        for previous_record, previous in reversed(events):
+            if previous['type'] == 'task_started' and (not payload.get('turn_id') or previous.get('turn_id') == payload.get('turn_id')):
+                started = event_time(previous.get('started_at')) or event_time(previous_record.get('timestamp'))
+                break
+    if kind == 'task_complete':
+        finish = event_time(payload.get('completed_at')) or event_time(record.get('timestamp'))
+        return {'start': started, 'finish': finish, 'state': '已完成', 'duration_ms': payload.get('duration_ms'), 'event_at': event_time(record.get('timestamp')) or finish}
+    state = '未结束' if kind == 'task_started' else '已中断' if kind in ('turn_aborted', 'task_aborted') else '失败'
+    return {'start': started, 'finish': None, 'state': state, 'duration_ms': None, 'event_at': event_time(record.get('timestamp')) or started}
+
+
+def session_times(row):
+    path = row.get('rollout_path')
+    if path:
+        try:
+            info = os.stat(path)
+            return lifecycle_tail(path, info.st_mtime_ns, info.st_size)
+        except OSError:
+            pass
+    return {'start': None, 'finish': None, 'state': '未知', 'duration_ms': None}
+
+
+class ExecutionFollower:
+    """Follow new start/complete events, never metadata changes or old history."""
+    def __init__(self):
+        self.fingerprints = None
+        self.watermark = time.time()
+
+    def poll(self, rows):
+        fingerprints = {}
+        changed = []
+        for row in rows:
+            path = row.get('rollout_path')
+            try:
+                info = os.stat(path) if path else None
+                fingerprint = (path, info.st_mtime_ns, info.st_size) if info else None
+            except OSError:
+                fingerprint = None
+            fingerprints[row['id']] = fingerprint
+            if self.fingerprints is not None and fingerprint is not None and fingerprint != self.fingerprints.get(row['id']):
+                changed.append(row)
+        self.fingerprints = fingerprints
+        candidates = []
+        for row in changed:
+            timing = session_times(row)
+            event_at = timing.get('event_at')
+            if timing['state'] in ('未结束', '已完成') and event_at is not None and event_at > self.watermark:
+                candidates.append((event_at, row['id'], timing['state']))
+        if not candidates:
+            return None
+        event_at, session_id, state = max(candidates)
+        self.watermark = event_at
+        return {'id': session_id, 'state': state, 'event_at': event_at}
+
+
+def format_time(value, seconds=False):
+    if value is None:
+        return '未知'
+    try:
+        return datetime.datetime.fromtimestamp(value).strftime('%m-%d %H:%M:%S' if seconds else '%m-%d %H:%M')
+    except (ValueError, OSError, OverflowError):
+        return '未知'
+
+
+def resume_command(row):
+    session_id = str(uuid.UUID(row['id']))
+    args = ['codex', 'resume', session_id]
+    if row['cwd']:
+        args += ['--cd', row['cwd']]
+    command = shlex.join(args)
+    if row['archived']:
+        command = shlex.join(['codex', 'unarchive', session_id]) + ' && ' + command
+    return command
+
+
+def clean(value):
+    return ''.join(c if unicodedata.category(c)[0] != 'C' else ' ' for c in str(value))
+
+
+def clip(text, width):
+    result, used = [], 0
+    for char in clean(text):
+        size = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in 'WF' else 1
+        if used + size > max(0, width):
+            break
+        result.append(char)
+        used += size
+    return ''.join(result)
+
+
+def copy_command(command):
+    executable = shutil.which('pbcopy')
+    if not executable:
+        return '未找到剪贴板命令；按 q 退出后会打印选中的命令。'
+    try:
+        subprocess.run([executable], input=command, text=True, check=True, timeout=3)
+        return '命令已复制，请在另一个终端粘贴执行；此列表继续保留。'
+    except (subprocess.SubprocessError, OSError):
+        return '复制失败；按 q 退出后会打印选中的命令。'
+
+
+def path_color_index(path, count):
+    normalized = os.path.normpath(os.path.expanduser(path)) if path else ''
+    digest = hashlib.sha256(normalized.encode('utf-8')).digest()
+    return int.from_bytes(digest[:8], 'big') % max(1, count)
+
+
+def path_palette():
+    if not curses.has_colors():
+        return [0]
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        shades = [81, 114, 180, 147, 215, 110, 218, 150, 117, 183, 222, 158, 209, 153, 194, 223, 123, 177, 221, 216, 120, 159, 189, 210] if curses.COLORS >= 256 else [curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_MAGENTA, curses.COLOR_BLUE, curses.COLOR_RED]
+        result = []
+        for index, shade in enumerate(shades[:max(0, curses.COLOR_PAIRS - 1)], 1):
+            curses.init_pair(index, shade, -1)
+            result.append(curses.color_pair(index))
+        return result or [0]
+    except curses.error:
+        return [0]
+
+
+def rename_session(home, session_id, name):
+    session_id = str(uuid.UUID(session_id))
+    name = name.strip()
+    if not name or len(name) > 200 or clean(name) != name:
+        raise ValueError('标题应为 1–200 个字符，且不能包含换行或控制字符。')
+    environment = dict(os.environ, CODEX_HOME=str(home))
+    process = subprocess.Popen(['codex', 'app-server', '--listen', 'stdio://'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            buffer = b''
+
+            def send(value):
+                process.stdin.write((json.dumps(value, ensure_ascii=False) + '\n').encode('utf-8'))
+                process.stdin.flush()
+
+            def response(request_id):
+                nonlocal buffer
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    while b'\n' in buffer:
+                        raw, buffer = buffer.split(b'\n', 1)
+                        try:
+                            value = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if value.get('id') == request_id:
+                            if 'error' in value:
+                                raise RuntimeError(value['error'].get('message', 'Codex 拒绝修改标题'))
+                            if 'result' in value:
+                                return value['result']
+                        if 'method' in value and 'id' in value:
+                            send({'id': value['id'], 'error': {'code': -32601, 'message': 'Unsupported request in metadata-only client'}})
+                    ready = selector.select(max(0, deadline - time.monotonic()))
+                    if not ready:
+                        break
+                    data = os.read(process.stdout.fileno(), 65536)
+                    if not data:
+                        raise RuntimeError('Codex app-server 连接已关闭。')
+                    buffer += data
+                raise RuntimeError('保存超时，请刷新列表确认标题后重试。')
+
+            send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'codex_sessions_picker', 'version': '1.0.0'}}})
+            response(1)
+            send({'method': 'initialized'})
+            send({'id': 2, 'method': 'thread/name/set', 'params': {'threadId': session_id, 'name': name}})
+            response(2)
+    finally:
+        if process.stdin:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        if process.stdout:
+            process.stdout.close()
+
+
+def picker(screen, home, include_archived, cli_only):
+    curses.curs_set(0)
+    screen.timeout(250)
+    colors = path_palette()
+    rows, filtered, index, query, editing, refreshed = [], [], 0, '', False, 0
+    message, selected_command, error = '', '', ''
+    selected_id = None
+    renaming, draft = False, ''
+    follower, follow, pending_focus = ExecutionFollower(), True, None
+    while True:
+        if time.monotonic() - refreshed >= 5:
+            try:
+                rows = load_sessions(home, include_archived, cli_only)
+                event = follower.poll(rows)
+                if follow and event:
+                    pending_focus = event
+                error = ''
+            except (OSError, sqlite3.Error, RuntimeError) as exc:
+                error = str(exc)
+            refreshed = time.monotonic()
+            if selected_id:
+                index = next((i for i, r in enumerate(rows) if r['id'] == selected_id), index)
+        if follow and pending_focus and not editing and not renaming:
+            target = next((row for row in rows if row['id'] == pending_focus['id']), None)
+            if target:
+                selected_id = target['id']
+                query = ''
+                message = '自动跟随：' + ('开始执行' if pending_focus['state'] == '未结束' else '执行完成') + ' · ' + clean(target['title'])
+            pending_focus = None
+        terms = query.casefold().split()
+        filtered = [row for row in rows if all(term in ' '.join(str(row[k]) for k in ('title', 'cwd', 'id', 'source')).casefold() for term in terms)]
+        if selected_id:
+            index = next((i for i, row in enumerate(filtered) if row['id'] == selected_id), index)
+        index = min(max(0, index), max(0, len(filtered) - 1))
+        selected = filtered[index] if filtered else None
+        selected_id = selected['id'] if selected else None
+        height, width = screen.getmaxyx()
+        screen.erase()
+
+        def line(y, text, attr=0):
+            if 0 <= y < height:
+                try:
+                    screen.addstr(y, 0, clip(text, width - 1), attr)
+                except curses.error:
+                    pass
+
+        line(0, 'Codex 会话列表 · 每 5 秒刷新 · 同路径同色 · 跟随' + ('开' if follow else '关'), curses.A_BOLD)
+        line(1, '↑↓ 选择  Enter 复制命令  / 搜索  a 切换归档  s 来源  n 改名  r 刷新  q 退出')
+        line(2, f'范围：{"含已归档" if include_archived else "未归档"} | {"仅 CLI" if cli_only else "CLI + IDE"} | {len(filtered)} 条 | 搜索：{query}' + (' ▏' if editing else ''))
+        line(3, '最近一轮：发起时间 → 完成时间   f 开关自动跟随')
+        if height < 13 or width < 50:
+            line(4, '请将终端窗口调整到至少 50 列、13 行。')
+        else:
+            visible = height - 11
+            start = max(0, index - visible // 2)
+            start = min(start, max(0, len(filtered) - visible))
+            for y, row in enumerate(filtered[start:start + visible], 4):
+                times = session_times(row)
+                stamp = format_time(times['start'])
+                finish = format_time(times['finish']) if times['finish'] is not None else times['state']
+                flag = '归档' if row['archived'] else '历史'
+                stamp += ' ' * max(0, 11 - sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in stamp))
+                finish += ' ' * max(0, 11 - sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in finish))
+                text = f'{stamp} → {finish}  {flag}  {row["source"]:6}  {row["title"] or "（未命名）"}'
+                color = colors[path_color_index(row['cwd'], len(colors))]
+                line(y, text, color | (curses.A_REVERSE | curses.A_BOLD if row['id'] == selected_id else 0))
+            if not filtered:
+                line(4, '暂无匹配会话。按 / 修改搜索，按 a 查看归档。')
+            line(height - 6, '─' * (width - 1))
+            if selected:
+                line(height - 5, '标题：' + selected['title'])
+                line(height - 4, '目录：' + selected['cwd'], colors[path_color_index(selected['cwd'], len(colors))])
+                line(height - 3, resume_command(selected), curses.A_BOLD)
+                times = session_times(selected)
+                timing = '发起 ' + format_time(times['start'], True) + '  完成 ' + (format_time(times['finish'], True) if times['finish'] is not None else times['state'])
+                if isinstance(times['duration_ms'], (int, float)):
+                    timing += f"  耗时 {times['duration_ms'] / 1000:.1f}s"
+                line(height - 2, timing)
+            line(height - 1, error or message)
+            if renaming:
+                line(height - 2, '新标题：' + draft + ' ▏')
+                line(height - 1, 'Enter 保存  Esc 取消  Ctrl+U 清空（会同步修改 Codex 会话名）')
+        screen.refresh()
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
+        if renaming:
+            if key == '\x1b':
+                renaming = False
+            elif key in ('\n', '\r', curses.KEY_ENTER):
+                if not draft.strip():
+                    message = '标题不能为空，请按 n 重新输入。'
+                    renaming = False
+                    continue
+                try:
+                    line(height - 1, '正在通过 Codex 保存标题…')
+                    screen.refresh()
+                    rename_session(home, selected_id, draft)
+                    message = '标题已保存。'
+                    query = ''
+                    refreshed = 0
+                    renaming = False
+                except (OSError, ValueError, RuntimeError) as exc:
+                    renaming = False
+                    message = '保存失败：' + str(exc)
+            elif key == '\x15':
+                draft = ''
+            elif key in (curses.KEY_BACKSPACE, '\b', '\x7f'):
+                draft = draft[:-1]
+            elif isinstance(key, str) and key.isprintable() and len(draft) < 200:
+                draft += key
+            continue
+        if editing:
+            if key in ('\n', '\r', '\x1b'):
+                editing = False
+            elif key in (curses.KEY_BACKSPACE, '\b', '\x7f'):
+                query = query[:-1]
+                selected_id = None
+                index = 0
+            elif isinstance(key, str) and key.isprintable():
+                query += key
+                selected_id = None
+                index = 0
+            continue
+        if key in ('q', '\x1b'):
+            return selected_command
+        if key in (curses.KEY_DOWN, 'j', curses.KEY_NPAGE):
+            index = min(len(filtered) - 1, index + (max(1, height - 11) if key == curses.KEY_NPAGE else 1))
+            selected_id = filtered[index]['id'] if filtered else None
+        elif key in (curses.KEY_UP, 'k', curses.KEY_PPAGE):
+            index = max(0, index - (max(1, height - 11) if key == curses.KEY_PPAGE else 1))
+            selected_id = filtered[index]['id'] if filtered else None
+        elif key in ('\n', '\r', curses.KEY_ENTER) and selected:
+            selected_command = resume_command(selected)
+            message = copy_command(selected_command)
+        elif key in ('n', curses.KEY_F2) and selected:
+            draft = clean(selected['title'])[:200]
+            renaming = True
+        elif key == '/':
+            editing = True
+        elif key == 'a':
+            include_archived = not include_archived
+            refreshed = 0
+        elif key == 's':
+            cli_only = not cli_only
+            refreshed = 0
+        elif key == 'f':
+            follow = not follow
+            pending_focus = None
+            message = '自动跟随已开启：有新执行或完成事件时切换高亮。' if follow else '自动跟随已关闭：保持手动选择。'
+        elif key == 'r':
+            refreshed = 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description='常驻 Codex 会话列表：选择后复制 resume 命令，列表不会关闭。')
+    parser.add_argument('--archived', action='store_true', help='同时显示已归档会话')
+    parser.add_argument('--cli-only', action='store_true', help='仅显示 CLI 来源，默认包含 IDE 会话')
+    parser.add_argument('--json', action='store_true', help='输出会话元数据，不启动交互界面')
+    parser.add_argument('--command', metavar='SESSION_ID', help='只打印指定会话的打开命令')
+    parser.add_argument('--home', type=Path, default=Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))), help='Codex 数据目录')
+    args = parser.parse_args()
+    home = args.home.expanduser().resolve()
+    try:
+        rows = load_sessions(home, args.archived or bool(args.command), args.cli_only)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        elif args.command:
+            row = next((row for row in rows if row['id'] == args.command), None)
+            if not row:
+                raise RuntimeError('未找到该交互会话。')
+            print(resume_command(row))
+        else:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise RuntimeError('请在交互终端中运行 codex-sessions；脚本中可使用 --json 或 --command。')
+            command = curses.wrapper(picker, home, args.archived, args.cli_only)
+            if command:
+                print(command)
+    except (OSError, sqlite3.Error, RuntimeError, curses.error) as exc:
+        print(f'codex-sessions: {exc}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
