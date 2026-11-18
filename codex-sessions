@@ -373,10 +373,15 @@ def picker(screen, home, include_archived, cli_only):
             line(0, usage_line, curses.A_BOLD | reset_colors[0], x=screen.getyx()[1])
             line(0, ' · 下次刷新 ', x=screen.getyx()[1])
             reset_attr = 0
+            countdown = ''
             if resets_at is not None:
                 seconds_left = resets_at - time.time()
                 reset_attr = reset_colors[(seconds_left <= 86400) + (seconds_left <= 3600)]
-            line(0, reset_text, reset_attr, x=screen.getyx()[1])
+                days, hours = divmod(math.floor(max(0, seconds_left) / 3600), 24)
+                countdown = f' 还有{days}天{hours}小时' if days else f' 还有{hours}小时'
+                if 0 < seconds_left < 3600:
+                    countdown = ' 不到1小时'
+            line(0, reset_text + countdown, reset_attr, x=screen.getyx()[1])
         else:
             line(0, usage_line)
         line(1, 'Codex 会话列表 · 每 5 秒刷新 · 同路径同色 · 跟随' + ('开' if follow else '关'), curses.A_BOLD)
