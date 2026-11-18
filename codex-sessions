@@ -272,7 +272,22 @@ def app_server_request(home, method, params=None):
             process.stdout.close()
 
 
-def weekly_usage_line(limits):
+def reset_palette(first_pair):
+    fallback = (0, 0, curses.A_BOLD)
+    if not curses.has_colors() or first_pair + 2 >= curses.COLOR_PAIRS:
+        return fallback
+    shades = (81, 114, 120) if curses.COLORS >= 256 else (
+        curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_GREEN)
+    try:
+        for pair, shade in enumerate(shades, first_pair):
+            curses.init_pair(pair, shade, -1)
+        return (curses.color_pair(first_pair), curses.color_pair(first_pair + 1),
+                curses.color_pair(first_pair + 2) | curses.A_BOLD)
+    except curses.error:
+        return fallback
+
+
+def weekly_usage_display(limits):
     buckets = limits.get('rateLimitsByLimitId') or {}
     snapshot = buckets.get('codex') or limits.get('rateLimits') or {}
     for window in (snapshot.get('primary'), snapshot.get('secondary')):
@@ -283,22 +298,23 @@ def weekly_usage_line(limits):
                 remaining = f'{max(0, min(100, 100 - used)):g}%'
             resets_at = window.get('resetsAt')
             reset = format_time(resets_at) if type(resets_at) in (int, float) else '未知'
-            return f'本周剩余 {remaining} · 下次刷新 {reset}'
-    return '本周额度不可用'
+            return remaining, reset, resets_at if reset != '未知' else None
+    return '本周额度不可用', '', None
 
 
 def refresh_weekly_usage(home, results):
     try:
         limits = app_server_request(home, 'account/rateLimits/read')
-        results.put(weekly_usage_line(limits))
+        results.put(weekly_usage_display(limits))
     except (OSError, RuntimeError, ValueError, AttributeError, TypeError, OverflowError):
-        results.put('本周额度暂不可用')
+        results.put(('本周额度暂不可用', '', None))
 
 
 def picker(screen, home, include_archived, cli_only):
     curses.curs_set(0)
     screen.timeout(250)
     colors = path_palette()
+    reset_colors = reset_palette(len(colors) + 1)
     rows, filtered, index, query, editing, refreshed = [], [], 0, '', False, 0
     message, selected_command, error = '', '', ''
     selected_id = None
@@ -306,10 +322,11 @@ def picker(screen, home, include_archived, cli_only):
     follower, follow, pending_focus = ExecutionFollower(), True, None
     usage_results = SimpleQueue()
     usage_line = '正在读取本周额度…'
+    reset_text, resets_at = '', None
     usage_pending, usage_refresh_at = False, 0
     while True:
         if not usage_results.empty():
-            usage_line = usage_results.get_nowait()
+            usage_line, reset_text, resets_at = usage_results.get_nowait()
             usage_pending = False
         if not usage_pending and time.monotonic() >= usage_refresh_at:
             usage_pending = True
@@ -344,17 +361,27 @@ def picker(screen, home, include_archived, cli_only):
         height, width = screen.getmaxyx()
         screen.erase()
 
-        def line(y, text, attr=0):
-            if 0 <= y < height:
+        def line(y, text, attr=0, x=0):
+            if 0 <= y < height and x < width - 1:
                 try:
-                    screen.addstr(y, 0, clip(text, width - 1), attr)
+                    screen.addstr(y, x, clip(text, width - x - 1), attr)
                 except curses.error:
                     pass
 
-        line(0, 'Codex 会话列表 · 每 5 秒刷新 · 同路径同色 · 跟随' + ('开' if follow else '关'), curses.A_BOLD)
-        line(1, '↑↓ 选择  Enter 复制命令  / 搜索  a 切换归档  s 来源  n 改名  r 刷新  q 退出')
-        line(2, f'范围：{"含已归档" if include_archived else "未归档"} | {"仅 CLI" if cli_only else "CLI + IDE"} | {len(filtered)} 条 | 搜索：{query}' + (' ▏' if editing else ''))
-        line(3, usage_line)
+        if reset_text:
+            line(0, '本周剩余 ')
+            line(0, usage_line, curses.A_BOLD | reset_colors[0], x=screen.getyx()[1])
+            line(0, ' · 下次刷新 ', x=screen.getyx()[1])
+            reset_attr = 0
+            if resets_at is not None:
+                seconds_left = resets_at - time.time()
+                reset_attr = reset_colors[(seconds_left <= 86400) + (seconds_left <= 3600)]
+            line(0, reset_text, reset_attr, x=screen.getyx()[1])
+        else:
+            line(0, usage_line)
+        line(1, 'Codex 会话列表 · 每 5 秒刷新 · 同路径同色 · 跟随' + ('开' if follow else '关'), curses.A_BOLD)
+        line(2, '↑↓ 选择  Enter 复制命令  / 搜索  a 切换归档  s 来源  n 改名  r 刷新  q 退出')
+        line(3, f'范围：{"含已归档" if include_archived else "未归档"} | {"仅 CLI" if cli_only else "CLI + IDE"} | {len(filtered)} 条 | 搜索：{query}' + (' ▏' if editing else ''))
         line(4, '最近一轮：发起时间 → 完成时间   f 开关自动跟随')
         if height < 13 or width < 50:
             line(5, '请将终端窗口调整到至少 50 列、13 行。')
