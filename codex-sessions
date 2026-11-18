@@ -7,7 +7,9 @@ import datetime
 import hashlib
 from functools import lru_cache
 import json
+import math
 import os
+from queue import SimpleQueue
 import selectors
 from pathlib import Path
 import shlex
@@ -15,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from threading import Thread
 import time
 import unicodedata
 import uuid
@@ -206,6 +209,10 @@ def rename_session(home, session_id, name):
     name = name.strip()
     if not name or len(name) > 200 or clean(name) != name:
         raise ValueError('标题应为 1–200 个字符，且不能包含换行或控制字符。')
+    app_server_request(home, 'thread/name/set', {'threadId': session_id, 'name': name})
+
+
+def app_server_request(home, method, params=None):
     environment = dict(os.environ, CODEX_HOME=str(home))
     process = subprocess.Popen(['codex', 'app-server', '--listen', 'stdio://'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
     try:
@@ -229,7 +236,7 @@ def rename_session(home, session_id, name):
                             continue
                         if value.get('id') == request_id:
                             if 'error' in value:
-                                raise RuntimeError(value['error'].get('message', 'Codex 拒绝修改标题'))
+                                raise RuntimeError(value['error'].get('message', 'Codex 请求失败。'))
                             if 'result' in value:
                                 return value['result']
                         if 'method' in value and 'id' in value:
@@ -241,13 +248,16 @@ def rename_session(home, session_id, name):
                     if not data:
                         raise RuntimeError('Codex app-server 连接已关闭。')
                     buffer += data
-                raise RuntimeError('保存超时，请刷新列表确认标题后重试。')
+                raise RuntimeError('Codex 请求超时。')
 
             send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'codex_sessions_picker', 'version': '1.0.0'}}})
             response(1)
             send({'method': 'initialized'})
-            send({'id': 2, 'method': 'thread/name/set', 'params': {'threadId': session_id, 'name': name}})
-            response(2)
+            request = {'id': 2, 'method': method}
+            if params is not None:
+                request['params'] = params
+            send(request)
+            return response(2)
     finally:
         if process.stdin:
             process.stdin.close()
@@ -262,6 +272,29 @@ def rename_session(home, session_id, name):
             process.stdout.close()
 
 
+def weekly_usage_line(limits):
+    buckets = limits.get('rateLimitsByLimitId') or {}
+    snapshot = buckets.get('codex') or limits.get('rateLimits') or {}
+    for window in (snapshot.get('primary'), snapshot.get('secondary')):
+        if window and window.get('windowDurationMins') == 7 * 24 * 60:
+            used = window.get('usedPercent')
+            remaining = '未知'
+            if type(used) in (int, float) and math.isfinite(used):
+                remaining = f'{max(0, min(100, 100 - used)):g}%'
+            resets_at = window.get('resetsAt')
+            reset = format_time(resets_at) if type(resets_at) in (int, float) else '未知'
+            return f'本周剩余 {remaining} · 下次刷新 {reset}'
+    return '本周额度不可用'
+
+
+def refresh_weekly_usage(home, results):
+    try:
+        limits = app_server_request(home, 'account/rateLimits/read')
+        results.put(weekly_usage_line(limits))
+    except (OSError, RuntimeError, ValueError, AttributeError, TypeError, OverflowError):
+        results.put('本周额度暂不可用')
+
+
 def picker(screen, home, include_archived, cli_only):
     curses.curs_set(0)
     screen.timeout(250)
@@ -271,7 +304,17 @@ def picker(screen, home, include_archived, cli_only):
     selected_id = None
     renaming, draft = False, ''
     follower, follow, pending_focus = ExecutionFollower(), True, None
+    usage_results = SimpleQueue()
+    usage_line = '正在读取本周额度…'
+    usage_pending, usage_refresh_at = False, 0
     while True:
+        if not usage_results.empty():
+            usage_line = usage_results.get_nowait()
+            usage_pending = False
+        if not usage_pending and time.monotonic() >= usage_refresh_at:
+            usage_pending = True
+            usage_refresh_at = time.monotonic() + 60
+            Thread(target=refresh_weekly_usage, args=(home, usage_results), daemon=True).start()
         if time.monotonic() - refreshed >= 5:
             try:
                 rows = load_sessions(home, include_archived, cli_only)
@@ -311,14 +354,15 @@ def picker(screen, home, include_archived, cli_only):
         line(0, 'Codex 会话列表 · 每 5 秒刷新 · 同路径同色 · 跟随' + ('开' if follow else '关'), curses.A_BOLD)
         line(1, '↑↓ 选择  Enter 复制命令  / 搜索  a 切换归档  s 来源  n 改名  r 刷新  q 退出')
         line(2, f'范围：{"含已归档" if include_archived else "未归档"} | {"仅 CLI" if cli_only else "CLI + IDE"} | {len(filtered)} 条 | 搜索：{query}' + (' ▏' if editing else ''))
-        line(3, '最近一轮：发起时间 → 完成时间   f 开关自动跟随')
+        line(3, usage_line)
+        line(4, '最近一轮：发起时间 → 完成时间   f 开关自动跟随')
         if height < 13 or width < 50:
-            line(4, '请将终端窗口调整到至少 50 列、13 行。')
+            line(5, '请将终端窗口调整到至少 50 列、13 行。')
         else:
             visible = height - 11
             start = max(0, index - visible // 2)
             start = min(start, max(0, len(filtered) - visible))
-            for y, row in enumerate(filtered[start:start + visible], 4):
+            for y, row in enumerate(filtered[start:start + visible], 5):
                 times = session_times(row)
                 stamp = format_time(times['start'])
                 finish = format_time(times['finish']) if times['finish'] is not None else times['state']
@@ -329,7 +373,7 @@ def picker(screen, home, include_archived, cli_only):
                 color = colors[path_color_index(row['cwd'], len(colors))]
                 line(y, text, color | (curses.A_REVERSE | curses.A_BOLD if row['id'] == selected_id else 0))
             if not filtered:
-                line(4, '暂无匹配会话。按 / 修改搜索，按 a 查看归档。')
+                line(5, '暂无匹配会话。按 / 修改搜索，按 a 查看归档。')
             line(height - 6, '─' * (width - 1))
             if selected:
                 line(height - 5, '标题：' + selected['title'])
@@ -415,6 +459,8 @@ def picker(screen, home, include_archived, cli_only):
             message = '自动跟随已开启：有新执行或完成事件时切换高亮。' if follow else '自动跟随已关闭：保持手动选择。'
         elif key == 'r':
             refreshed = 0
+            if not usage_pending:
+                usage_refresh_at = 0
 
 
 def main():
